@@ -531,7 +531,7 @@ def generate_visualization(poi_row, roads_gdf, output_folder, poi_id=None):
     """Generate visualization using satellite imagery instead of matplotlib"""
     try:
         # Define API key explicitly 
-        api_key = 'soLfEc1KZmaeWBIBSdfhCEytfR6S6qnLsP45R8JWoYA'
+        api_key = '<API KEY>'
         
         # Create output directory if it doesn't exist
         os.makedirs(output_folder, exist_ok=True)
