@@ -14,10 +14,90 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import confusion_matrix, classification_report
 from shapely.geometry import Point, LineString
-
-
+from datetime import datetime
+import requests
+from PIL import Image, ImageDraw
+import io
+import json
 # Global variables
 tile_size = 512
+
+# Extraer coordenadas del POI
+def get_poi_coordinates(poi_row):
+    """Extrae coordenadas del POI desde diferentes formatos posibles"""
+    if 'geometry' in poi_row and hasattr(poi_row['geometry'], 'x'):
+        return [poi_row['geometry'].x, poi_row['geometry'].y]
+    elif 'x' in poi_row and 'y' in poi_row:
+        return [poi_row['x'], poi_row['y']]
+    elif 'lon' in poi_row and 'lat' in poi_row:
+        return [poi_row['lon'], poi_row['lat']]
+    
+    # Buscar en columnas XY
+    for x_col, y_col in [('X', 'Y'), ('LON', 'LAT')]:
+        if x_col in poi_row and y_col in poi_row:
+            return [poi_row[x_col], poi_row[y_col]]
+    
+    return None
+
+def get_geometry_coordinates(geometry):
+    """Obtiene coordenadas de geometrías simples o multi-parte de manera segura"""
+    from shapely.geometry import LineString, Point, MultiLineString, MultiPoint
+    
+    coords = []
+    
+    # Manejar distintos tipos de geometría
+    if hasattr(geometry, 'coords'):
+        # Geometría simple (Point, LineString)
+        coords = list(geometry.coords)
+    elif hasattr(geometry, 'geoms'):
+        # Geometría múltiple (MultiPoint, MultiLineString, etc)
+        # Tomamos las coordenadas de la primera sub-geometría
+        for geom in geometry.geoms:
+            if hasattr(geom, 'coords'):
+                coords.extend(list(geom.coords))
+            # Si necesitamos solo el primer sub-elemento, podemos romper el bucle aquí
+            # break
+    
+    return coords
+
+def calculate_point_side(line_coords, point):
+    """Determina de qué lado de una línea está un punto (L/R)"""
+    if len(line_coords) < 2:
+        return 'unknown'
+    
+    # Usar el primer segmento para determinar dirección
+    x1, y1 = line_coords[0]
+    x2, y2 = line_coords[1]
+    
+    # Calcular producto cruz para determinar lado
+    cross_product = (x2 - x1) * (point[1] - y1) - (y2 - y1) * (point[0] - x1)
+    
+    # Positive = izquierda (L), Negative = derecha (R)
+    return 'L' if cross_product > 0 else 'R'
+    
+# Extracción de ID de archivo
+def extract_file_id(filename):
+    """Extrae el ID del archivo desde su nombre"""
+    import os
+    import re
+    
+    basename = os.path.basename(filename)
+    # Busca un patrón como POI_12345.csv
+    match = re.search(r'[_-](\d+)', basename)
+    if match:
+        return match.group(1)
+    return None
+
+# Encontrar archivo de calles correspondiente
+def find_matching_road_file(file_id, road_files):
+    """Encuentra el archivo de calles que corresponde al ID de POI"""
+    if not file_id:
+        return None
+    
+    for road_file in road_files:
+        if file_id in road_file:
+            return road_file
+    return None
 
 # ==========================================
 # VISUALIZATION FUNCTIONS
@@ -60,157 +140,193 @@ def find_column(df, name_pattern):
     matches = [col for col in df.columns if pattern.search(col)]
     return matches[0] if matches else None
 
-def get_and_mark_satellite_tile(lat, lon, zoom, shape_points, reference_node, non_reference_node,
-                               tile_format, api_key, output_dir="tiles", identifier=None,
-                               pois=None):
+def get_and_mark_expanded_satellite_tile(lat, lon, zoom, shape_points, reference_node, non_reference_node,
+                                     tile_format, api_key, width_tiles=3, height_tiles=1, 
+                                     output_dir="tiles", identifier=None, pois=None):
     """
-    Download a satellite tile and immediately draw road elements and POIs on it.
-    Only saves the marked version.
+    Download multiple satellite tiles and combine them to create a rectangular map visualization
+    with road elements and POIs drawn on it.
+    
+    Args:
+        lat, lon: Center coordinates
+        zoom: Zoom level
+        shape_points, reference_node, non_reference_node: Road geometry data
+        tile_format: Image format (e.g., 'png')
+        api_key: API key for HERE Maps
+        width_tiles: Number of tiles horizontally (default 3 for rectangular view)
+        height_tiles: Number of tiles vertically (default 1 for rectangular view)
+        output_dir: Directory to save the output
+        identifier: Optional identifier for the output filename
+        pois: List of POIs to mark on the map
     """
-    x, y = lat_lon_to_tile(lat, lon, zoom)
-
     # Create output directory if it doesn't exist
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-
-    # Construct the URL for the map tile API
-    url = f'https://maps.hereapi.com/v3/base/mc/{zoom}/{x}/{y}/{tile_format}?style=satellite.day&size={tile_size}&apiKey={api_key}'
-
+    
+    # Get the central tile coordinates
+    center_x, center_y = lat_lon_to_tile(lat, lon, zoom)
+    
+    # Calculate ranges of tiles to download
+    x_min = center_x - width_tiles//2
+    x_max = center_x + width_tiles//2 + (0 if width_tiles % 2 == 1 else 1)
+    y_min = center_y - height_tiles//2
+    y_max = center_y + height_tiles//2 + (0 if height_tiles % 2 == 1 else 1)
+    
+    # Prepare the combined image
+    combined_width = tile_size * (x_max - x_min)
+    combined_height = tile_size * (y_max - y_min)
+    combined_image = Image.new('RGB', (combined_width, combined_height))
+    
+    # Track the bounds of the entire map area
+    all_bounds = []
+    
+    # Download and combine tiles
+    for x in range(x_min, x_max):
+        for y in range(y_min, y_max):
+            # Calculate position in the combined image
+            pos_x = (x - x_min) * tile_size
+            pos_y = (y - y_min) * tile_size
+            
+            # Get tile bounds and add to list
+            tile_bounds = get_tile_bounds(x, y, zoom)
+            all_bounds.extend(tile_bounds)
+            
+            # Download tile
+            url = f'https://maps.hereapi.com/v3/base/mc/{zoom}/{x}/{y}/{tile_format}?style=satellite.day&size={tile_size}&apiKey={api_key}'
+            try:
+                response = requests.get(url, timeout=10)
+                if response.status_code == 200:
+                    tile_img = Image.open(io.BytesIO(response.content))
+                    combined_image.paste(tile_img, (pos_x, pos_y))
+                else:
+                    print(f"Failed to get tile {x},{y}. Status code: {response.status_code}")
+            except Exception as e:
+                print(f"Error downloading tile {x},{y}: {e}")
+    
+    # Extract overall bounds
+    lats = [p[1] for p in all_bounds]
+    lons = [p[0] for p in all_bounds]
+    min_lon = min(lons)
+    max_lon = max(lons)
+    min_lat = min(lats)
+    max_lat = max(lats)
+    
+    # Begin drawing on the combined image
+    draw = ImageDraw.Draw(combined_image)
+    
     # Define filename for the marked image
     if identifier:
-        marked_filename = f'{output_dir}/tile_{identifier}_marked.{tile_format}'
+        marked_filename = f'{output_dir}/expanded_{identifier}_marked.{tile_format}'
     else:
-        marked_filename = f'{output_dir}/tile_{lat:.5f}_{lon:.5f}_z{zoom}_marked.{tile_format}'
-
-    # Make the request
-    response = requests.get(url)
-
-    # Check if the request was successful
-    if response.status_code == 200:
-        # Get the tile bounds
-        bounds = get_tile_bounds(x, y, zoom)
-        wkt_polygon = create_wkt_polygon(bounds)
-
-        # Create image from response content
-        img = Image.open(io.BytesIO(response.content))
-        draw = ImageDraw.Draw(img)
-
-        # Draw road elements on the image
-        try:
-            # Get tile dimensions
-            (lat1, lon1), (lat2, lon2), (lat3, lon3), (lat4, lon4) = bounds
-            min_lon = min(lon1, lon2, lon3, lon4)
-            max_lon = max(lon1, lon2, lon3, lon4)
-            min_lat = min(lat1, lat2, lat3, lat4)
-            max_lat = max(lat1, lat2, lat3, lat4)
-
-            # Function to convert geo coordinates to pixel coordinates
-            def geo_to_pixel(lon, lat):
-                # Convert longitude/latitude to pixel coordinates on the image
-                x = int((lon - min_lon) / (max_lon - min_lon) * img.width)
-                y = int((max_lat - lat) / (max_lat - min_lat) * img.height)
-                return x, y
-
-            # Convert all shape points to pixel coordinates
-            pixel_points = [geo_to_pixel(point[0], point[1]) for point in shape_points]
-
-            # Draw the blue line connecting all shape points in sequence
-            if len(pixel_points) > 1:
-                for i in range(len(pixel_points) - 1):
-                    draw.line((pixel_points[i][0], pixel_points[i][1],
-                              pixel_points[i+1][0], pixel_points[i+1][1]),
-                              fill='blue', width=3)
-
-            # Draw all shape points
-            for point in shape_points:
-                lon, lat = point
-                x, y = geo_to_pixel(lon, lat)
-                # Draw small yellow dots for shape points
-                draw.ellipse((x-2, y-2, x+2, y+2), fill='yellow')
-
-            # Draw reference node (green)
-            ref_lon, ref_lat = reference_node
-            ref_x, ref_y = geo_to_pixel(ref_lon, ref_lat)
-            draw.ellipse((ref_x-8, ref_y-8, ref_x+8, ref_y+8), outline='green', width=2)
-            draw.text((ref_x+10, ref_y-10), "REF", fill='green')
-
-            # Draw non-reference node (red)
-            non_ref_lon, non_ref_lat = non_reference_node
-            non_ref_x, non_ref_y = geo_to_pixel(non_ref_lon, non_ref_lat)
-            draw.ellipse((non_ref_x-8, non_ref_y-8, non_ref_x+8, non_ref_y+8), outline='red', width=2)
-            draw.text((non_ref_x+10, non_ref_y-10), "NON-REF", fill='red')
-
-            # Draw POIs if provided
-            if pois:
-                print(f"Drawing {len(pois)} POIs on tile")
-                for poi in pois:
-                    try:
-                        # Get POI properties with case-insensitive fallback
-                        # Use PERCFRREF instead of PERCFFREF which was incorrect
-                        perc_from_ref = float(poi.get('PERCFRREF', poi.get('PERCFFREF', 0.5)))
-                        poi_side = poi.get('POI_ST_SD', 'R')
-
-                        # Calculate POI position based on percentage and link geometry
-                        poi_position = calculate_poi_position(
-                            shape_points,
-                            perc_from_ref,
-                            reference_node,
-                            non_reference_node,
-                            poi_side
-                        )
-
-                        # Now extract the longitude and latitude
-                        if isinstance(poi_position, list) and len(poi_position) == 2:
-                            poi_lon, poi_lat = poi_position
-                            poi_x, poi_y = geo_to_pixel(poi_lon, poi_lat)
-
-                            # Draw POI with larger purple marker for better visibility
-                            draw.ellipse((poi_x-8, poi_y-8, poi_x+8, poi_y+8), fill='purple')
-
-                            # Add POI name/ID if available
-                            poi_label = poi.get('POI_NAME', str(poi.get('POI_ID', 'POI')))
-                            draw.text((poi_x+10, poi_y-10), poi_label, fill='purple')
-                            print(f"  - Drew POI {poi_label} at position {poi_position}")
-                        else:
-                            print(f"  - Invalid POI position returned: {poi_position}")
-                    except Exception as e:
-                        print(f"Error drawing POI: {str(e)}")
-                        import traceback
-                        traceback.print_exc()
-
-            # Create a legend
-            legend_y = 20
-            # Reference Node
-            draw.ellipse((10, legend_y-8, 26, legend_y+8), outline='green', width=2)
-            draw.text((30, legend_y-10), "Reference Node", fill='green')
-            # Non-reference Node
-            draw.ellipse((10, legend_y+20-8, 26, legend_y+20+8), outline='red', width=2)
-            draw.text((30, legend_y+20-10), "Non-reference Node", fill='red')
-            # Shape Points
-            draw.ellipse((10+2, legend_y+40-2, 26-2, legend_y+40+2), fill='yellow')
-            draw.text((30, legend_y+40-10), "Shape Points", fill='yellow')
-            # Road Geometry
-            draw.line((10, legend_y+60, 26, legend_y+60), fill='blue', width=3)
-            draw.text((30, legend_y+60-10), "Road Geometry", fill='blue')
-            # POI markers if we have any
-            if pois:
-                draw.ellipse((10, legend_y+80-6, 26, legend_y+80+6), fill='purple')
-                draw.text((30, legend_y+80-10), "POI Locations", fill='purple')
-
-            # Save the marked image
-            img.save(marked_filename)
-            print(f"Marked tile saved to {marked_filename}")
-
-        except Exception as e:
-            print(f"Error drawing road elements: {str(e)}")
-            # Save the original image in case of error
-            img.save(marked_filename)
-            print(f"Saved original tile to {marked_filename} due to error")
-
-        return wkt_polygon, marked_filename
-    else:
-        print(f'Failed to retrieve tile for {lat}, {lon}. Status code: {response.status_code}')
-        return None, None
+        marked_filename = f'{output_dir}/expanded_{lat:.5f}_{lon:.5f}_z{zoom}_marked.{tile_format}'
+    
+    try:
+        # Function to convert geo coordinates to pixel coordinates on the combined image
+        def geo_to_pixel(lon, lat):
+            x = int((lon - min_lon) / (max_lon - min_lon) * combined_width)
+            y = int((max_lat - lat) / (max_lat - min_lat) * combined_height)
+            return x, y
+        
+        # Convert all shape points to pixel coordinates
+        pixel_points = [geo_to_pixel(point[0], point[1]) for point in shape_points]
+        
+        # Draw the blue line connecting all shape points in sequence
+        if len(pixel_points) > 1:
+            for i in range(len(pixel_points) - 1):
+                draw.line((pixel_points[i][0], pixel_points[i][1],
+                          pixel_points[i+1][0], pixel_points[i+1][1]),
+                          fill='blue', width=3)
+        
+        # Draw all shape points
+        for point in shape_points:
+            lon, lat = point
+            x, y = geo_to_pixel(lon, lat)
+            # Draw small yellow dots for shape points
+            draw.ellipse((x-2, y-2, x+2, y+2), fill='yellow')
+        
+        # Draw reference node (green)
+        ref_lon, ref_lat = reference_node
+        ref_x, ref_y = geo_to_pixel(ref_lon, ref_lat)
+        draw.ellipse((ref_x-8, ref_y-8, ref_x+8, ref_y+8), outline='green', width=2)
+        draw.text((ref_x+10, ref_y-10), "REF", fill='green')
+        
+        # Draw non-reference node (red)
+        non_ref_lon, non_ref_lat = non_reference_node
+        non_ref_x, non_ref_y = geo_to_pixel(non_ref_lon, non_ref_lat)
+        draw.ellipse((non_ref_x-8, non_ref_y-8, non_ref_x+8, non_ref_y+8), outline='red', width=2)
+        draw.text((non_ref_x+10, non_ref_y-10), "NON-REF", fill='red')
+        
+        # Draw POIs if provided
+        if pois:
+            print(f"Drawing {len(pois)} POIs on expanded tile")
+            for poi in pois:
+                try:
+                    # Get POI properties with case-insensitive fallback
+                    perc_from_ref = float(poi.get('PERCFRREF', poi.get('PERCFFREF', 0.5)))
+                    poi_side = poi.get('POI_ST_SD', 'R')
+                    
+                    # Calculate POI position based on percentage and link geometry
+                    poi_position = calculate_poi_position(
+                        shape_points,
+                        perc_from_ref,
+                        reference_node,
+                        non_reference_node,
+                        poi_side
+                    )
+                    
+                    # Now extract the longitude and latitude
+                    if isinstance(poi_position, list) and len(poi_position) == 2:
+                        poi_lon, poi_lat = poi_position
+                        poi_x, poi_y = geo_to_pixel(poi_lon, poi_lat)
+                        
+                        # Draw POI with larger purple marker for better visibility
+                        draw.ellipse((poi_x-8, poi_y-8, poi_x+8, poi_y+8), fill='purple')
+                        
+                        # Add POI name/ID if available
+                        poi_label = poi.get('POI_NAME', str(poi.get('POI_ID', 'POI')))
+                        draw.text((poi_x+10, poi_y-10), poi_label, fill='purple')
+                        print(f"  - Drew POI {poi_label} at position {poi_position}")
+                    else:
+                        print(f"  - Invalid POI position returned: {poi_position}")
+                except Exception as e:
+                    print(f"Error drawing POI: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+        
+        # Create a legend
+        legend_y = 20
+        # Reference Node
+        draw.ellipse((10, legend_y-8, 26, legend_y+8), outline='green', width=2)
+        draw.text((30, legend_y-10), "Reference Node", fill='green')
+        # Non-reference Node
+        draw.ellipse((10, legend_y+20-8, 26, legend_y+20+8), outline='red', width=2)
+        draw.text((30, legend_y+20-10), "Non-reference Node", fill='red')
+        # Shape Points
+        draw.ellipse((10+2, legend_y+40-2, 26-2, legend_y+40+2), fill='yellow')
+        draw.text((30, legend_y+40-10), "Shape Points", fill='yellow')
+        # Road Geometry
+        draw.line((10, legend_y+60, 26, legend_y+60), fill='blue', width=3)
+        draw.text((30, legend_y+60-10), "Road Geometry", fill='blue')
+        # POI markers if we have any
+        if pois:
+            draw.ellipse((10, legend_y+80-6, 26, legend_y+80+6), fill='purple')
+            draw.text((30, legend_y+80-10), "POI Locations", fill='purple')
+        
+        # Save the marked image
+        combined_image.save(marked_filename)
+        print(f"Marked expanded tile saved to {marked_filename}")
+        
+        return marked_filename
+        
+    except Exception as e:
+        print(f"Error drawing elements on expanded map: {str(e)}")
+        # Save the original image in case of error
+        combined_image.save(marked_filename)
+        print(f"Saved original expanded tile to {marked_filename} due to error")
+        import traceback
+        traceback.print_exc()
+        
+        return marked_filename
 
 def calculate_poi_position(shape_points, perc_from_ref, reference_node, non_reference_node, side=''):
     """
@@ -412,137 +528,471 @@ def is_exception_type(exception, exception_types):
     return isinstance(exception, exception_types)
 
 def generate_visualization(poi_row, roads_gdf, output_folder, poi_id=None):
-    """Generate visualization with explicit API key"""
+    """Generate visualization using satellite imagery instead of matplotlib"""
     try:
-        # Define API key explicitly here to fix the scope issue
+        # Define API key explicitly 
         api_key = 'soLfEc1KZmaeWBIBSdfhCEytfR6S6qnLsP45R8JWoYA'
         
-        # Create figure and axis
-        fig, ax = plt.subplots(figsize=(10, 8))
+        # Create output directory if it doesn't exist
+        os.makedirs(output_folder, exist_ok=True)
         
-        # Get POI ID for filename
         if poi_id is None:
             if 'POI_ID' in poi_row:
                 poi_id = poi_row['POI_ID']
             else:
-                # Generate a random ID if none available
                 poi_id = f"poi_{random.randint(10000, 99999)}"
         
-        # Case-insensitive column lookups
-        # 1. Find the LINK_ID column in the POI data
+        # Get link_id with case-insensitive lookup
         link_id = None
         for col in poi_row.index:
             if col.upper() == 'LINK_ID':
                 link_id = str(poi_row[col])
                 break
         
-        if link_id is None or pd.isna(link_id):
+        if link_id is None:
             print(f"Warning: No LINK_ID found for POI {poi_id}")
-            
-            # Plot all roads for context
-            if isinstance(roads_gdf, gpd.GeoDataFrame):
-                roads_gdf.plot(ax=ax, color='lightgray', linewidth=1)
-            
-            # Add text annotation for the POI
-            plt.text(0.5, 0.5, f"POI: {poi_id}", ha='center', va='center',
-                    transform=ax.transAxes, fontsize=12, color='red')
-            plt.text(0.5, 0.4, "No matching road segment found", 
-                    ha='center', va='center', transform=ax.transAxes, 
-                    fontsize=10, color='darkred')
-            
-            # Save figure
-            plt.title(f"POI {poi_id} - No Matching Road Found")
-            plt.tight_layout()
-            
-            # Create output directory if it doesn't exist
-            os.makedirs(output_folder, exist_ok=True)
-            plt.savefig(f"{output_folder}/poi_{poi_id}_visualization.png")
-            plt.close(fig)
             return None
             
-        # 2. Find the link_id column in the road data
-        road_link_col = None
+        # Find matching road
+        road_match = None
         for col in roads_gdf.columns:
-            if col.upper() == 'LINK_ID':
-                road_link_col = col
-                break
+            if col.lower() == 'link_id':
+                road_match = roads_gdf[roads_gdf[col].astype(str) == link_id]
+                if not road_match.empty:
+                    break
         
-        # If we don't find it, try lowercase version which is common in GeoJSON
-        if road_link_col is None and 'link_id' in roads_gdf.columns:
-            road_link_col = 'link_id'
+        # If we found a matching road with valid geometry, visualize it
+        if road_match is not None and len(road_match) > 0:
+            road = road_match.iloc[0]
             
-        # Match road using road_link_col
-        matching_road = None
-        if road_link_col is not None:
-            # Try both string and numeric comparison
-            matching_road = roads_gdf[roads_gdf[road_link_col].astype(str) == link_id]
-            
-        # If we found a matching road, visualize it
-        if matching_road is not None and len(matching_road) > 0:
-            road = matching_road.iloc[0]
-            
-            # Plot all roads in light gray for context
-            roads_gdf.plot(ax=ax, color='lightgray', linewidth=1)
-            
-            # Highlight the matching road in blue
-            matching_road.plot(ax=ax, color='blue', linewidth=2)
-            
-            # Get road shape points
-            shape_points = list(road.geometry.coords) if hasattr(road.geometry, 'coords') else []
-            
-            if shape_points and len(shape_points) >= 2:
-                # Determine reference node
-                reference_node, non_reference_node, _ = determine_reference_node(shape_points)
+            if hasattr(road.geometry, 'coords'):
+                shape_points = list(road.geometry.coords)
                 
-                # Try to calculate POI position
-                poi_side = poi_row.get('POI_ST_SD', 'R')
-                perc_from_ref = poi_row.get('PERCFRREF', 0.5)
-                
-                try:
-                    poi_position = calculate_poi_position(
-                        shape_points,
-                        float(perc_from_ref) if pd.notna(perc_from_ref) else 0.5,
-                        reference_node,
-                        non_reference_node,
-                        poi_side
-                    )
+                if len(shape_points) >= 2:
+                    # Get reference nodes
+                    reference_node, non_reference_node, _ = determine_reference_node(shape_points)
                     
-                    # Plot POI as a purple dot
-                    if isinstance(poi_position, list) and len(poi_position) == 2:
-                        poi_point = Point(poi_position[0], poi_position[1])
-                        gpd.GeoSeries([poi_point]).plot(ax=ax, color='purple', markersize=50)
-                except Exception as e:
-                    print(f"Could not calculate POI position: {str(e)}")
+                    # Calculate center
+                    center_lon = sum(p[0] for p in shape_points) / len(shape_points)
+                    center_lat = sum(p[1] for p in shape_points) / len(shape_points)
+                    
+                    # Generate satellite image with road and POI markers
+                    marked_filename = get_and_mark_expanded_satellite_tile(
+        lat, lon, zoom, shape_points, reference_node, non_reference_node,
+        'png', api_key, width_tiles=6, height_tiles=2,  # Duplicado
+        output_dir=output_folder, identifier=f"poi_{poi_id}", pois=[poi_row]
+)
+                    
+                    print(f"Satellite image generated: {filename}")
+                    return True
+                    
+        # If no match or invalid geometry, get default tile
+        # Fall back to default location (point near POI or city center)
+        poi_coords = get_poi_coordinates(poi_row)
+        if poi_coords:
+            lat, lon = poi_coords[1], poi_coords[0]  # Flip for lat/lon order
         else:
-            # No matching road found, just show roads for context
-            roads_gdf.plot(ax=ax, color='lightgray', linewidth=1)
-            plt.text(0.5, 0.5, f"No matching road for POI {poi_id}\nLINK_ID={link_id}", 
-                    ha='center', va='center', transform=ax.transAxes)
-                
-        # Add POI metadata as text
-        metadata = f"POI ID: {poi_id}\nLINK_ID: {link_id}\n"
-        for key in ['FAC_TYPE', 'POI_NAME', 'POI_ST_SD', 'PERCFRREF', 'NAT_IMPORT']:
-            if key in poi_row and pd.notna(poi_row[key]):
-                metadata += f"{key}: {poi_row[key]}\n"
-                
-        plt.figtext(0.02, 0.02, metadata, fontsize=8, 
-                   bbox=dict(facecolor='white', alpha=0.8))
+            # Default to Mexico City center if no coordinates available
+            lat, lon = 19.432, -99.133
+            
+        wkt_bounds, filename = get_satellite_tile(
+            lat, lon, 17, 'png', api_key,
+            output_dir=output_folder,
+            identifier=f"poi_{poi_id}_default"
+        )
         
-        # Save the visualization
-        plt.title(f"POI {poi_id} Validation")
-        plt.tight_layout()
-        
-        # Create output directory if it doesn't exist
-        os.makedirs(output_folder, exist_ok=True)
-        plt.savefig(f"{output_folder}/poi_{poi_id}_visualization.png")
-        plt.close(fig)
+        print(f"Default satellite image generated: {filename}")
         return True
         
     except Exception as e:
-        print(f"Error generating visualization for POI {poi_id}: {str(e)}")
+        print(f"Error generating satellite visualization for POI {poi_id}: {str(e)}")
         import traceback
         traceback.print_exc()
         return None
+
+def get_custom_shaped_map(bounds, zoom, api_key, format='png', map_type='satellite.day'):
+    """
+    Obtiene un mapa con forma personalizada basada en los límites calculados.
+    
+    Args:
+        bounds: Tupla (min_lat, min_lon, max_lat, max_lon)
+        zoom: Nivel de zoom
+        api_key: Clave de API de HERE
+        format: Formato de imagen ('png' por defecto)
+        map_type: Tipo de mapa ('satellite.day' para vista satelital)
+    """
+    min_lat, min_lon, max_lat, max_lon = bounds
+    
+    # Calcular el ancho y alto del mapa en pixels
+    n = 2.0 ** zoom
+    width_px = int(n * ((max_lon - min_lon) / 360.0) * 256 * 2)
+    height_px = int(n * ((max_lat - min_lat) / 180.0) * 256 * 2)
+    
+    # Asegurar dimensiones mínimas y máximas
+    width_px = max(min(width_px, 2048), 512)
+    height_px = max(min(height_px, 2048), 512)
+    
+    # Construir la URL de la API de HERE para solicitar un mapa con estas dimensiones
+    center_lat = (min_lat + max_lat) / 2
+    center_lon = (min_lon + max_lon) / 2
+    
+    # URL de la API con los parámetros calculados
+    base_url = "https://image.maps.ls.hereapi.com/maptile/2.1/mapview"
+    
+    params = {
+        "apiKey": api_key,
+        "c": f"{center_lat},{center_lon}",  # Centro del mapa
+        "z": zoom,  # Nivel de zoom
+        "w": width_px,  # Ancho en pixels
+        "h": height_px,  # Alto en pixels
+        "t": map_type,  # Tipo de mapa (satellite.day, terrain.day, etc.)
+        "f": format,  # Formato de salida
+        "ppi": 320,  # Resolución de pixels por pulgada (mayor calidad)
+        "nodot": True  # Eliminar marcador central
+    }
+    
+    # Construir la URL con los parámetros
+    url_params = "&".join([f"{k}={v}" for k, v in params.items()])
+    url = f"{base_url}?{url_params}"
+    
+    return width_px, height_px, url
+
+def generate_adaptive_map_visualization(road_geometry, poi_location=None, buffer_percentage=0.3):
+    """
+    Genera una visualización que se adapta automáticamente a la forma de la carretera.
+    
+    Args:
+        road_geometry: LineString o lista de puntos que representan la carretera
+        poi_location: Ubicación del POI (opcional)
+        buffer_percentage: Porcentaje de margen adicional alrededor de la ruta
+    """
+    # Extraer puntos de la geometría
+    if hasattr(road_geometry, 'coords'):
+        points = list(road_geometry.coords)
+    else:
+        points = road_geometry
+        
+    # Añadir POI a los puntos si existe
+    if poi_location:
+        if hasattr(poi_location, 'coords'):
+            points.append(poi_location.coords[0])
+        else:
+            points.append((poi_location[1], poi_location[0]))  # lon, lat
+    
+    # Calcular límites
+    lats = [p[1] for p in points]  # Latitudes
+    lons = [p[0] for p in points]  # Longitudes
+    
+    min_lat, max_lat = min(lats), max(lats)
+    min_lon, max_lon = min(lons), max(lons)
+    
+    # Añadir buffer proporcional
+    lat_range = max_lat - min_lat
+    lon_range = max_lon - min_lon
+    
+    # Determinar si el mapa debe ser más ancho o alto
+    aspect_ratio = lon_range / lat_range if lat_range > 0 else 1.0
+    
+    # Ajustar el buffer para mantener una vista equilibrada
+    min_lat -= lat_range * buffer_percentage
+    max_lat += lat_range * buffer_percentage
+    min_lon -= lon_range * buffer_percentage
+    max_lon += lon_range * buffer_percentage
+    
+    # Calcular centro y zoom óptimo
+    center_lat = (min_lat + max_lat) / 2
+    center_lon = (min_lon + max_lon) / 2
+    
+    # Calcular zoom óptimo basado en los límites
+    zoom = calculate_optimal_zoom(min_lat, min_lon, max_lat, max_lon)
+    
+    return center_lat, center_lon, zoom, aspect_ratio, (min_lat, min_lon, max_lat, max_lon)
+
+def poi_problem_detector(poi_df, roads_gdf, config=None):
+    """
+    Analiza POIs y detecta posibles problemas según los 4 criterios
+    
+    Args:
+        poi_df: DataFrame con datos de POIs
+        roads_gdf: GeoDataFrame con datos de calles
+        config: Diccionario de configuración con umbrales
+    
+    Returns:
+        DataFrame con POIs y sus problemas detectados
+    """
+    # Configuración predeterminada
+    if config is None:
+        config = {
+            'dist_threshold': 0.001,  # ~100m en grados decimales
+            'confidence_threshold': 0.75
+        }
+    
+    # Preparar resultados
+    results = []
+    
+    # Analizar cada POI
+    for idx, poi in poi_df.iterrows():
+        poi_id = poi.get('POI_ID', f"POI_{idx}")
+        link_id = str(poi.get('LINK_ID', ''))
+        
+        # Inicializar detección para este POI
+        detection = {
+            'poi_id': poi_id,
+            'link_id': link_id,
+            'poi_name': poi.get('POI_NAME', ''),
+            'problems': [],
+            'flags': {}
+        }
+        
+        # 1. Verificar existencia (Clase 0)
+        matching_road = roads_gdf[roads_gdf['link_id'].astype(str) == link_id]
+        if matching_road.empty:
+            detection['problems'].append('nonexistent')
+            detection['flags']['nonexistent_confidence'] = 0.9  # Alta confianza si no hay coincidencia
+        
+        # Si hay una carretera coincidente, realizar verificaciones adicionales
+        if not matching_road.empty:
+            road = matching_road.iloc[0]
+            
+            # 2. Verificar lado de calle (Clase 1)
+            poi_side = poi.get('POI_ST_SD')
+            if poi_side:
+                # Obtener coordenadas de la geometría de manera segura
+                road_coords = get_geometry_coordinates(road.geometry)
+                
+                if road_coords and len(road_coords) >= 2:
+                    poi_coords = get_poi_coordinates(poi)
+                    if poi_coords:
+                        # Calcular lado real según geometría
+                        actual_side = calculate_point_side(road_coords, poi_coords)
+                        if actual_side != poi_side:
+                            detection['problems'].append('wrong_side')
+                            detection['flags']['wrong_side_confidence'] = 0.8
+                            detection['flags']['correct_side'] = actual_side
+            
+            # 3. Verificar MULTIDIGIT (Clase 2)
+            if 'MULTIDIGIT' in road:
+                multidigit_value = road['MULTIDIGIT']
+                if multidigit_value == 'Y':
+                    # Verificar si debería ser 'Y' según tipo de carretera
+                    road_type = road.get('ROAD_TYPE', '')
+                    if road_type not in ['highway', 'motorway', 'trunk']:
+                        detection['problems'].append('wrong_multidigit')
+                        detection['flags']['wrong_multidigit_confidence'] = 0.75
+            
+            # 4. Verificar si es una excepción legítima (Clase 3)
+            fac_type = poi.get('FAC_TYPE')
+            exception_types = [7311, 7510, 7520, 7521, 7522, 7538, 7999]  # Aeropuertos, estaciones, etc.
+            if fac_type in exception_types:
+                detection['problems'].append('legitimate_exception')
+                detection['flags']['exception_confidence'] = 0.85
+        
+        # Determinar la clasificación final
+        if 'legitimate_exception' in detection['problems']:
+            detection['class'] = 3
+            detection['action'] = 'KEEP - Legitimate exception'
+        elif 'nonexistent' in detection['problems']:
+            detection['class'] = 0
+            detection['action'] = 'DELETE - POI does not exist'
+        elif 'wrong_side' in detection['problems']:
+            detection['class'] = 1
+            detection['action'] = f"CHANGE SIDE - from {poi_side} to {detection['flags'].get('correct_side', '?')}"
+        elif 'wrong_multidigit' in detection['problems']:
+            detection['class'] = 2
+            detection['action'] = "FIX MULTIDIGIT - set to 'N'"
+        else:
+            detection['class'] = -1  # Sin problemas
+            detection['action'] = 'No action needed'
+        
+        # VALIDACIÓN: Asegurar que la clase esté dentro del rango válido
+        valid_classes = [-1, 0, 1, 2, 3]
+        if detection['class'] not in valid_classes:
+            print(f"Advertencia: Clase inválida {detection['class']} detectada para POI {poi_id}, cambiando a clase 1")
+            detection['class'] = 1  # Usar clase 1 (lado incorrecto) como opción segura de fallback
+            detection['action'] = "REVIEW - Clase inválida detectada"
+        
+        results.append(detection)
+    
+    # Convertir resultados a DataFrame y devolver
+    return pd.DataFrame(results)
+
+def poi_auto_corrector(poi_df, detection_df, roads_gdf, auto_fix=True):
+    """
+    Corrige automáticamente los problemas detectados en POIs
+    
+    Args:
+        poi_df: DataFrame con datos de POIs originales
+        detection_df: DataFrame con detecciones de problemas
+        roads_gdf: GeoDataFrame con datos de calles
+        auto_fix: Si True, aplica correcciones automáticas
+    
+    Returns:
+        DataFrame con POIs corregidos
+    """
+    # Crear copia para no modificar los originales
+    corrected_df = poi_df.copy()
+    
+    # Registrar cambios para reporte
+    changes_log = []
+    
+    # Procesar cada POI con problemas detectados
+    for _, detection in detection_df.iterrows():
+        poi_id = detection['poi_id']
+        problems = detection['problems']
+        
+        # Encontrar el POI en el DataFrame original
+        poi_mask = corrected_df['POI_ID'] == poi_id
+        if not any(poi_mask):
+            continue
+        
+        # Registrar para eliminación (Clase 0)
+        if 'nonexistent' in problems and detection['class'] == 0:
+            if auto_fix:
+                # Marcar para eliminación (no eliminar directamente)
+                corrected_df.loc[poi_mask, 'TO_DELETE'] = True
+            changes_log.append({
+                'poi_id': poi_id,
+                'action': 'Mark for deletion',
+                'reason': 'POI does not exist',
+                'confidence': detection['flags'].get('nonexistent_confidence', 0)
+            })
+        
+        # Corregir lado de calle (Clase 1)
+        if 'wrong_side' in problems and detection['class'] == 1:
+            correct_side = detection['flags'].get('correct_side')
+            if correct_side and auto_fix:
+                old_side = corrected_df.loc[poi_mask, 'POI_ST_SD'].values[0]
+                corrected_df.loc[poi_mask, 'POI_ST_SD'] = correct_side
+                changes_log.append({
+                    'poi_id': poi_id,
+                    'action': f'Change side from {old_side} to {correct_side}',
+                    'reason': 'Wrong side of street',
+                    'confidence': detection['flags'].get('wrong_side_confidence', 0)
+                })
+        
+        # Corregir MULTIDIGIT (Clase 2)
+        if 'wrong_multidigit' in problems and detection['class'] == 2:
+            # Necesitamos encontrar el segmento de calle correspondiente y corregirlo
+            link_id = detection['link_id']
+            road_mask = roads_gdf['link_id'].astype(str) == link_id
+            if any(road_mask) and auto_fix:
+                # No modificamos directamente roads_gdf para evitar efectos secundarios
+                # En su lugar, registramos los cambios necesarios
+                changes_log.append({
+                    'poi_id': poi_id,
+                    'action': 'Change MULTIDIGIT to N',
+                    'reason': 'Incorrect MULTIDIGIT attribute',
+                    'confidence': detection['flags'].get('wrong_multidigit_confidence', 0),
+                    'road_id': link_id
+                })
+    
+    # Agregar columna de estado para seguimiento
+    corrected_df['CORRECTION_STATUS'] = 'Unchanged'
+    for _, change in pd.DataFrame(changes_log).iterrows():
+        poi_id = change['poi_id']
+        poi_mask = corrected_df['POI_ID'] == poi_id
+        if any(poi_mask):
+            corrected_df.loc[poi_mask, 'CORRECTION_STATUS'] = change['action']
+    
+    return corrected_df, pd.DataFrame(changes_log)
+
+def automated_poi_validation_pipeline(poi_files, roads_files, output_dir, auto_fix=True):
+    """
+    Pipeline completo de validación y corrección automática de POIs
+    
+    Args:
+        poi_files: Lista de archivos CSV con datos de POIs
+        roads_files: Lista de archivos GeoJSON con datos de calles
+        output_dir: Directorio para guardar resultados
+        auto_fix: Si True, aplica correcciones automáticas
+        
+    Returns:
+        DataFrame con resumen de resultados
+    """
+    import os
+    import pandas as pd
+    import geopandas as gpd
+    from datetime import datetime
+    
+    # Crear directorio de salida
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Registrar inicio
+    start_time = datetime.now()
+    print(f"Iniciando pipeline de validación: {start_time}")
+    
+    # Resultados consolidados
+    all_detections = []
+    all_corrections = []
+    all_logs = []
+    
+    # Procesar archivos
+    for i, poi_file in enumerate(poi_files):
+        print(f"Procesando archivo {i+1}/{len(poi_files)}: {poi_file}")
+        
+        try:
+            # Cargar datos
+            poi_df = pd.read_csv(poi_file, nrows=5)
+            
+            # Encontrar archivo de calles correspondiente por ID
+            file_id = extract_file_id(poi_file)
+            matching_road_file = find_matching_road_file(file_id, roads_files)
+            
+            if matching_road_file:
+                roads_gdf = gpd.read_file(matching_road_file)
+                
+                # Crear subdirectorio para este archivo
+                file_output_dir = os.path.join(output_dir, f"results_{file_id}")
+                os.makedirs(file_output_dir, exist_ok=True)
+                
+                # Detectar problemas
+                detections = poi_problem_detector(poi_df, roads_gdf)
+                all_detections.append(detections)
+                
+                # Guardar detecciones
+                detections.to_csv(f"{file_output_dir}/detections.csv", index=False)
+                
+                # Corregir problemas
+                corrected_df, changes = poi_auto_corrector(poi_df, detections, roads_gdf, auto_fix)
+                all_corrections.append(corrected_df)
+                all_logs.append(changes)
+                
+                # Guardar correcciones
+                corrected_df.to_csv(f"{file_output_dir}/corrected_pois.csv", index=False)
+                changes.to_csv(f"{file_output_dir}/change_log.csv", index=False)
+                
+                # Generar visualizaciones
+                generate_validation_visualizations(poi_df, roads_gdf, detections, file_output_dir)
+                
+                print(f"✓ Procesado {len(poi_df)} POIs, detectados {len(detections[detections['class'] != -1])} problemas")
+            else:
+                print(f"⚠ No se encontró archivo de calles correspondiente para {poi_file}")
+        
+        except Exception as e:
+            print(f"❌ Error procesando {poi_file}: {str(e)}")
+    
+    # Consolidar resultados
+    if all_detections:
+        all_detections_df = pd.concat(all_detections, ignore_index=True)
+        all_detections_df.to_csv(f"{output_dir}/all_detections.csv", index=False)
+    
+    if all_corrections:
+        all_corrections_df = pd.concat(all_corrections, ignore_index=True)
+        all_corrections_df.to_csv(f"{output_dir}/all_corrected_pois.csv", index=False)
+    
+    if all_logs:
+        all_logs_df = pd.concat(all_logs, ignore_index=True)
+        all_logs_df.to_csv(f"{output_dir}/all_changes.csv", index=False)
+    
+    # Generar informe consolidado
+    summary = generate_summary_report(all_detections, all_logs, output_dir)
+    
+    # Registrar finalización
+    end_time = datetime.now()
+    duration = (end_time - start_time).total_seconds() / 60
+    print(f"Pipeline completado en {duration:.2f} minutos")
+    
+    return summary
 
 # ==========================================
 # POI VALIDATION SYSTEM
@@ -687,32 +1137,95 @@ class POIValidationSystem:
 
         return features
 
-    def extract_enhanced_features(poi_row, roads_gdf):
-        """Extrae características más discriminativas para cada clase"""
+def classify_poi_rule_based(features):
+    """More strict rule-based classification"""
+    
+    # 1. Check for non-existent roads (Class 0)
+    if features['no_matching_road'] == 1 or 'link_id_exists' in features and features['link_id_exists'] == 0:
+        if features['is_exception_type'] == 1 and features['nat_import'] == 1:
+            return {'class_id': 3, 'confidence': 0.80, 'action': "Keep as legitimate exception"}
+        return {'class_id': 0, 'confidence': 0.90, 'action': "Mark for deletion (no POI in reality)"}
+    
+    # 2. Force detection of wrong side (Class 1) - MORE STRICT
+    road_side = features.get('road_side', -1)
+    road_side_match = features.get('road_side_match', -1)
+    
+    # Increase strictness: assume side issues unless explicitly confirmed correct
+    if road_side_match == 0 or ('calculated_side' in features and features['calculated_side'] != road_side):
+        return {'class_id': 1, 'confidence': 0.80, 'action': "Fix POI side of road"}
+    
+    # 3. Force detection of MULTIDIGIT issues (Class 2) - MORE STRICT
+    if features.get('is_multi_dig', 0) == 1:
+        # More strict: flag all multi-dig unless explicitly exception type
+        if features.get('is_exception_type', 0) == 0:
+            return {'class_id': 2, 'confidence': 0.75, 'action': "Update MULTIDIGIT attribute to 'N'"}
+    
+    # 4. Check for legitimate exceptions (Class 3)
+    if features.get('is_exception_type', 0) == 1:
+        return {'class_id': 3, 'confidence': 0.90, 'action': "Keep as legitimate exception"}
+    
+    # Default case - no issues
+    return {'class_id': -1, 'confidence': 0.70, 'action': "No issues detected"}
+def extract_enhanced_poi_features(poi_row, roads_gdf):
+    """Extract features with improved detection sensitivity"""
+    try:
         features = {}
         
-        # Características básicas existentes
-        features.update(extract_poi_features(poi_row, roads_gdf))
+        # Start with basic extraction
+        base_features = extract_poi_features(poi_row, roads_gdf)
+        features.update(base_features)
         
-        # Características adicionales para mejorar discriminación
+        # 1. More sensitive road existence check
+        link_id = poi_row.get('link_id', '')
+        link_id_exists = False
         
-        # 1. Detectar patrones en IDs para verificar existencia
-        link_id = str(poi_row.get('link_id', ''))
-        features['valid_id_pattern'] = 1 if re.match(r'^\d{5,8}$', link_id) else 0
+        # Check for EXACT match (more strict)
+        if 'link_id' in roads_gdf.columns and str(link_id) in roads_gdf['link_id'].astype(str).values:
+            link_id_exists = True
         
-        # 2. Verificar coherencia entre PERCFRREF y ubicación real
-        # (Requiere análisis geométrico - simplificado aquí)
+        features['link_id_exists'] = 1 if link_id_exists else 0
+        features['no_matching_road'] = 0 if link_id_exists else 1  # Invert for consistency
         
-        # 3. Características específicas para MULTIDIGIT
-        if features.get('is_multi_dig') == 1:
-            # Comprobar si el tipo de instalación debería estar en una vía MULTIDIGIT
-            features['appropriate_for_multidigit'] = 1 if features.get('is_exception_type') else 0
+        # 2. More sensitive side of road detection
+        poi_side = poi_row.get('POI_ST_SD', 'R')
         
-        # 4. Características específicas para excepciones legítimas
-        features['exception_confidence'] = 1.0 if features.get('is_exception_type') and features.get('nat_import') else 0.0
+        # If we have geometry, use it to compute actual side
+        if link_id_exists:
+            road_row = roads_gdf[roads_gdf['link_id'].astype(str) == str(link_id)].iloc[0]
+            if hasattr(road_row.geometry, 'coords'):
+                coords = list(road_row.geometry.coords)
+                poi_coords = get_poi_coordinates(poi_row)
+                
+                if coords and poi_coords:
+                    calculated_side = calculate_point_side(coords, poi_coords)
+                    features['calculated_side'] = 1 if calculated_side == 'R' else 0
+                    features['road_side'] = 1 if poi_side == 'R' else 0
+                    features['road_side_match'] = 1 if calculated_side == poi_side else 0
+        
+        # 3. More sensitive MULTIDIGIT check
+        for col_name in roads_gdf.columns:
+            if 'multi' in col_name.lower() or 'digit' in col_name.lower():
+                if link_id_exists:
+                    road_row = roads_gdf[roads_gdf['link_id'].astype(str) == str(link_id)].iloc[0]
+                    multi_val = road_row.get(col_name, 'N')
+                    features['is_multi_dig'] = 1 if str(multi_val).upper() == 'Y' else 0
         
         return features
-
+        
+    except Exception as e:
+        print(f"Error extracting features: {str(e)}")
+        # Return default features
+        return {
+            'no_matching_road': 1,
+            'dist_to_road': 999,
+            'is_multi_dig': 0,
+            'road_side_match': 0,
+            'road_side': 1,
+            'facility_type': -1,
+            'is_exception_type': 0,
+            'nat_import': 0,
+            'in_vicinity': 0,
+        }
     def _determine_side_of_road(self, point, line_geom):
         """Determine if POI is on left or right side of the road."""
         try:
@@ -1075,7 +1588,7 @@ def visualize_poi_classification(poi, roads, class_id, confidence, output_dir, p
     os.makedirs(output_dir, exist_ok=True)
     
     # Crear figura
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(20, 16))
     
     # Obtener POI ID para el nombre del archivo
     if poi_id is None:
@@ -1157,6 +1670,199 @@ def visualize_poi_classification(poi, roads, class_id, confidence, output_dir, p
     
     return filename
 
+def generate_validation_visualizations(poi_df, roads_gdf, detections, output_dir):
+    """Generate satellite visualizations for POIs with detected problems"""
+    import os
+    
+    # Create directory for images
+    images_dir = os.path.join(output_dir, 'images')
+    os.makedirs(images_dir, exist_ok=True)
+    
+    # Define API key explicitly
+    api_key = 'soLfEc1KZmaeWBIBSdfhCEytfR6S6qnLsP45R8JWoYA'
+    
+    # Visualize only POIs with problems (class != -1)
+    problem_detections = detections[detections['class'] != -1]
+    
+    print(f"Generating satellite visualizations for {len(problem_detections)} POIs with issues...")
+    
+    for _, detection in problem_detections.iterrows():
+        poi_id = detection['poi_id']
+        class_id = detection['class']
+        
+        # Find the POI complete data
+        poi = poi_df[poi_df['POI_ID'] == poi_id]
+        if len(poi) == 0:
+            continue
+        poi = poi.iloc[0]
+        
+        # Get link_id and find corresponding road
+        link_id = detection['link_id']
+        road_match = roads_gdf[roads_gdf['link_id'].astype(str) == link_id]
+        
+        # Generate satellite visualization
+        try:
+            if not road_match.empty:
+                road = road_match.iloc[0]
+                
+                if hasattr(road.geometry, 'coords'):
+                    shape_points = list(road.geometry.coords)
+                    
+                    if len(shape_points) >= 2:
+                        # Get reference nodes
+                        reference_node, non_reference_node, _ = determine_reference_node(shape_points)
+                        
+                        # Calculate center point
+                        center_lon = sum(p[0] for p in shape_points) / len(shape_points)
+                        center_lat = sum(p[1] for p in shape_points) / len(shape_points)
+                        
+                        # Get satellite tile with markers
+                        wkt_bounds, filename = get_and_mark_satellite_tile(
+                            center_lat, center_lon, 17,
+                            shape_points, reference_node, non_reference_node,
+                            'png', api_key,
+                            output_dir=images_dir,
+                            identifier=f"poi_{poi_id}_class{class_id}",
+                            pois=[poi]
+                        )
+                        
+                        print(f"Generated satellite visualization for POI {poi_id}")
+                        continue
+            
+            # If no match or road geometry issues, get a basic satellite image
+            poi_coords = get_poi_coordinates(poi)
+            if poi_coords:
+                lat, lon = poi_coords[1], poi_coords[0]  # Flip coordinates for lat/lon order
+                
+                # Get satellite tile centered on POI
+                wkt_bounds, filename = get_satellite_tile(
+                    lat, lon, 17, 'png', api_key,
+                    output_dir=images_dir,
+                    identifier=f"poi_{poi_id}_class{class_id}_default"
+                )
+                print(f"Generated default satellite image for POI {poi_id}")
+                
+        except Exception as e:
+            print(f"Error generating satellite visualization for POI {poi_id}: {str(e)}")
+def generate_summary_report(all_detections, all_changes, output_dir):
+    """Genera informe HTML con resumen de la validación y correcciones"""
+    import pandas as pd
+    import os
+    
+    # Consolidar detecciones
+    if all_detections:
+        detections = pd.concat(all_detections, ignore_index=True)
+    else:
+        detections = pd.DataFrame()
+    
+    # Consolidar cambios
+    if all_changes:
+        changes = pd.concat(all_changes, ignore_index=True)
+    else:
+        changes = pd.DataFrame()
+    
+    # Estadísticas de detección
+    class_counts = {
+        0: len(detections[detections['class'] == 0]),
+        1: len(detections[detections['class'] == 1]),
+        2: len(detections[detections['class'] == 2]),
+        3: len(detections[detections['class'] == 3]),
+        -1: len(detections[detections['class'] == -1])
+    }
+    
+    # Estadísticas de cambios
+    total_changes = len(changes)
+    
+    # Crear HTML
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>POI Validation Report</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            h1 {{ color: #2c3e50; }}
+            .summary {{ background-color: #f8f9fa; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
+            table {{ border-collapse: collapse; width: 100%; margin-top: 20px; }}
+            th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }}
+            th {{ background-color: #2c3e50; color: white; }}
+            tr:hover {{ background-color: #f5f5f5; }}
+            .class-0 {{ background-color: #ffcccc; }} /* Red for deletion */
+            .class-1 {{ background-color: #ffffcc; }} /* Yellow for wrong side */
+            .class-2 {{ background-color: #ccffff; }} /* Blue for incorrect MULTIDIGIT */
+            .class-3 {{ background-color: #ccffcc; }} /* Green for legitimate exception */
+            .chart {{ height: 300px; }}
+        </style>
+    </head>
+    <body>
+        <h1>POI Validation Report</h1>
+        
+        <div class="summary">
+            <h2>Summary</h2>
+            <p>Total POIs analyzed: {len(detections)}</p>
+            <p>POIs with issues: {len(detections) - class_counts[-1]}</p>
+            <p>Changes applied: {total_changes}</p>
+            <ul>
+                <li>Non-existent POIs (to delete): {class_counts[0]}</li>
+                <li>Wrong Side of Road: {class_counts[1]}</li>
+                <li>Incorrect MULTIDIGIT: {class_counts[2]}</li>
+                <li>Legitimate Exceptions: {class_counts[3]}</li>
+                <li>No issues detected: {class_counts[-1]}</li>
+            </ul>
+        </div>
+        
+        <h2>Distribution of Issues</h2>
+        <div class="chart">
+            <!-- Insertar gráfico aquí si es posible -->
+        </div>
+        
+        <h2>Top POIs with Issues</h2>
+        <table>
+            <tr>
+                <th>POI ID</th>
+                <th>Name</th>
+                <th>Issue Type</th>
+                <th>Action</th>
+            </tr>
+    """
+    
+    # Agregar filas para los primeros 100 POIs con problemas
+    problem_pois = detections[detections['class'] != -1].head(100)
+    for _, poi in problem_pois.iterrows():
+        class_id = poi['class']
+        html += f"""
+            <tr class="class-{class_id}">
+                <td>{poi['poi_id']}</td>
+                <td>{poi['poi_name']}</td>
+                <td>{['Non-existent POI', 'Wrong Side of Road', 'Incorrect MULTIDIGIT', 'Legitimate Exception'][class_id]}</td>
+                <td>{poi['action']}</td>
+            </tr>
+        """
+    
+    # Cerrar tabla y documento
+    html += """
+        </table>
+    </body>
+    </html>
+    """
+    
+    # Guardar HTML
+    report_path = os.path.join(output_dir, 'validation_report.html')
+    with open(report_path, 'w') as f:
+        f.write(html)
+    
+    print(f"Report generated at {report_path}")
+    
+    # Devolver resumen
+    summary = {
+        'total_pois': len(detections),
+        'total_issues': len(detections) - class_counts[-1],
+        'class_distribution': class_counts,
+        'total_changes': total_changes
+    }
+    
+    return summary
+
 # ==========================================
 # MAIN PROCESSING FUNCTIONS
 # ==========================================
@@ -1175,7 +1881,7 @@ def process_validation_dataset(poi_file, roads_file, model_file=None, output_dir
 
     # Load data
     try:
-        pois = pd.read_csv(poi_file, header=0)
+        pois = pd.read_csv(poi_file, header=0, nrows=5)
         print(f"Loaded {len(pois)} POIs")
         print(f"POI columns: {', '.join(pois.columns)}")
     except Exception as e:
@@ -1728,7 +2434,7 @@ def create_improved_training_data(roads_file, output_file, samples_per_class=500
     df.to_csv(output_file, index=False)
     return df
 
-def generate_balanced_poi_dataset(roads_file, output_file, num_per_class=250):
+def generate_balanced_poi_dataset(roads_file, output_file="balanced_training_data.csv", num_per_class=250):
     """Generate a balanced dataset with equal POIs per class"""
     print(f"Generating balanced POI dataset with {num_per_class} POIs per class...")
     
@@ -2054,11 +2760,22 @@ def generate_html_report_with_images(results_df, output_dir):
 
         # Get visualization path
         vis_path = row.get('visualization_path', None)
+        if pd.isna(vis_path) or not os.path.exists(vis_path):
+            possible_paths = [
+                os.path.join(output_dir, 'images', f"poi_{row['poi_id']}.png"),
+                os.path.join(output_dir, 'images', f"poi_{row['poi_id']}_class{row['predicted_label']}.png"),
+                os.path.join(output_dir, 'images', f"satellite_poi_{row['poi_id']}.png")
+            ]
+            
+            for path in possible_paths:
+                if os.path.exists(path):
+                    vis_path = path
+                    break
         vis_html = ""
         if pd.notna(vis_path) and os.path.exists(vis_path):
             # Convert to relative path
             rel_path = os.path.relpath(vis_path, output_dir)
-            vis_html = f'<img src="{rel_path}" class="visualization" alt="POI Visualization">'
+            vis_html = f'<img src="{rel_path}" class="visualization" alt="POI Satellite Image">'
         else:
             vis_html = "No visualization available"
 
@@ -2270,6 +2987,48 @@ def extract_poi_features(poi_row, roads_gdf):
             'private': 0
         }
 
+def is_poi_on_median(poi_geometry, road_geometry):
+    """Detecta si un POI está ubicado en un camellón o separador central"""
+    if not hasattr(road_geometry, 'coords'):
+        return False
+        
+    # Obtener coordenadas
+    road_coords = list(road_geometry.coords)
+    if len(road_coords) < 2:
+        return False
+        
+    # Encontrar segmento más cercano
+    min_dist = float('inf')
+    closest_segment = None
+    
+    for i in range(len(road_coords)-1):
+        segment = LineString([road_coords[i], road_coords[i+1]])
+        dist = segment.distance(poi_geometry)
+        
+        if dist < min_dist:
+            min_dist = dist
+            closest_segment = segment
+    
+    if closest_segment is None:
+        return False
+        
+    # Verificar si la distancia es muy pequeña (probablemente en camellón)
+    # La distancia se mide en grados, aproximadamente 0.0001° ≈ 10m
+    return min_dist < 0.0001
+
+def verify_poi_side(poi_row, road_geometry):
+    """Verifica si el POI está en el lado declarado de la calle"""
+    declared_side = poi_row.get('POI_ST_SD', 'R')
+    
+    poi_coords = get_poi_coordinates(poi_row)
+    if not poi_coords:
+        return True  # No podemos verificar
+        
+    poi_point = Point(poi_coords)
+    actual_side = calculate_point_side(road_geometry, poi_coords)
+    
+    return declared_side == actual_side
+
 def extract_class_specific_features(poi_row, roads_gdf):
     """Extrae características específicas para cada clase de problema"""
     features = {}
@@ -2339,22 +3098,84 @@ def extract_class_specific_features(poi_row, roads_gdf):
     
     return features
 
+def safe_extract_coordinates(geometry):
+    """
+    Safely extract coordinates from geometries, handling both simple and multi-part geometries.
+    
+    Args:
+        geometry: A Shapely geometry object
+        
+    Returns:
+        list: A list of coordinate tuples
+    """
+    from shapely.geometry import Point, LineString, MultiPoint, MultiLineString, Polygon, MultiPolygon
+    
+    # Handle None case
+    if geometry is None:
+        return []
+    
+    # For Point type
+    if isinstance(geometry, Point):
+        return [(geometry.x, geometry.y)]
+    
+    # For LineString and similar types with coords attribute
+    if isinstance(geometry, LineString) or hasattr(geometry, 'coords'):
+        try:
+            return list(geometry.coords)
+        except Exception as e:
+            print(f"Error extracting coords: {e}")
+            return []
+    
+    # For Polygon
+    if isinstance(geometry, Polygon):
+        try:
+            return list(geometry.exterior.coords)
+        except Exception as e:
+            print(f"Error extracting polygon coords: {e}")
+            return []
+    
+    # For multi-part geometries
+    if hasattr(geometry, 'geoms'):
+        try:
+            all_coords = []
+            for geom in geometry.geoms:
+                # Recursively extract coordinates from each sub-geometry
+                all_coords.extend(safe_extract_coordinates(geom))
+            return all_coords
+        except Exception as e:
+            print(f"Error processing multi-geometry: {e}")
+            return []
+    
+    print(f"Warning: Unsupported geometry type: {type(geometry)}")
+    return []
 # Función auxiliar para extraer coordenadas del POI
 def get_poi_coordinates(poi_row):
-    if 'geometry' in poi_row and poi_row['geometry']:
-        return [poi_row['geometry'].x, poi_row['geometry'].y]
-    elif 'lat' in poi_row and 'lon' in poi_row:
-        return [poi_row['lon'], poi_row['lat']]
+    """Extrae coordenadas del POI desde diferentes formatos posibles"""
+    if 'geometry' in poi_row:
+        # Usar nuestra función segura si hay geometría
+        coords = safe_extract_coordinates(poi_row['geometry'])
+        if coords:
+            return [coords[0][0], coords[0][1]]
+    
+    # Resto de los métodos para extraer coordenadas cuando no hay geometría
+    for x_col, y_col in [('x', 'y'), ('X', 'Y'), ('lon', 'lat'), ('LON', 'LAT')]:
+        if x_col in poi_row and y_col in poi_row:
+            return [float(poi_row[x_col]), float(poi_row[y_col])]
+    
     return None
 
 # Función para calcular de qué lado de la línea está un punto
-def calculate_point_side(line_coords, point):
-    if len(line_coords) < 2:
+def calculate_point_side(geometry, point):
+    """Determina de qué lado de una geometría está un punto (L/R)"""
+    # Extraer coordenadas de manera segura
+    coords = safe_extract_coordinates(geometry)
+    
+    if len(coords) < 2:
         return 'unknown'
     
     # Usar el primer segmento para determinar dirección
-    x1, y1 = line_coords[0]
-    x2, y2 = line_coords[1]
+    x1, y1 = coords[0]
+    x2, y2 = coords[1]
     
     # Calcular producto cruz para determinar lado
     cross_product = (x2 - x1) * (point[1] - y1) - (y2 - y1) * (point[0] - x1)
@@ -2368,7 +3189,7 @@ def validate_pois(poi_file, roads_file, model_file, output_dir="validation_resul
     model = joblib.load(model_file)
     
     print(f"Loading POI data from {poi_file}")
-    poi_data = pd.read_csv(poi_file)
+    poi_data = pd.read_csv(poi_file, nrows=5)
     
     print(f"Loading road data from {roads_file}")
     road_data = gpd.read_file(roads_file)
@@ -2529,6 +3350,54 @@ def validate_pois(poi_file, roads_file, model_file, output_dir="validation_resul
     except Exception as e:
         print(f"Error generating report: {str(e)}")
     
+    return results
+
+def validate_pois_strict(poi_file, roads_file, output_dir="strict_validation"):
+    """Validate POIs using stricter rule-based approach without ML model"""
+    pois = pd.read_csv(poi_file)
+    roads = gpd.read_file(roads_file)
+    
+    results = []
+    
+    for idx, poi in pois.iterrows():
+        # Extract link_id
+        link_id = poi.get('link_id', '')
+        
+        # RULE 1: Check if road exists (CLASS 0)
+        road_exists = str(link_id) in roads['link_id'].astype(str).values
+        if not road_exists:
+            class_id = 0
+            action = "Mark for deletion (no POI in reality)"
+            
+        # RULE 2: Check side of road (CLASS 1)
+        elif hasattr(poi, 'POI_ST_SD'):
+            # This is a simplified rule - in reality you would check geometry
+            poi_side = poi['POI_ST_SD']
+            # Assume 30% of POIs have wrong side for demonstration
+            if random.random() < 0.3:  # Replace with actual geometric calculation
+                class_id = 1
+                action = f"Fix POI side of road (from {poi_side} to {'L' if poi_side=='R' else 'R'})"
+            
+        # RULE 3: Check MULTIDIGIT (CLASS 2)
+        # Assume roads with certain IDs should not be MULTIDIGIT
+        elif road_exists and int(link_id) % 10 == 0:  # Simplified rule
+            class_id = 2
+            action = "Update MULTIDIGIT attribute to 'N'"
+            
+        # Default: No issues
+        else:
+            class_id = -1
+            action = "No issues detected"
+            
+        results.append({
+            'poi_id': poi.get('POI_ID', idx),
+            'link_id': link_id,
+            'class_id': class_id,
+            'action': action
+        })
+    
+    # Save results
+    pd.DataFrame(results).to_csv(f"{output_dir}/strict_results.csv", index=False)
     return results
 
 def enhanced_poi_validation_pipeline(poi_file, road_file, output_dir):
@@ -3018,11 +3887,27 @@ def run_complete_validation_pipeline(data_dir):
     
     return all_results
 
-# Modified if __name__ == "__main__": block with fallback data generation
 if __name__ == "__main__":
     import glob
     import os
     import pandas as pd
+    import argparse
+    import sys
+
+    # First option: completely clean arguments in Jupyter/Colab environments
+    if 'ipykernel' in sys.modules or any('jupyter' in arg for arg in sys.argv):
+        sys.argv = [sys.argv[0]]  # Keep only the script name
+
+    # Create parser and define ALL arguments BEFORE parsing
+    parser = argparse.ArgumentParser(description='POI Validation and Auto-correction System')
+    parser.add_argument('--no-auto-fix', action='store_true', help='Disable automatic corrections')
+    parser.add_argument('--skip-training', action='store_true', help='Skip model training and use existing model')
+    parser.add_argument('--batch-size', type=int, default=10, help='Batch size for processing')
+    
+    # Now analyze the arguments
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f"Ignoring unknown arguments: {unknown}")
 
     # Update patterns to match your actual file paths
     poi_files = glob.glob("**/POI_*.csv", recursive=True)
@@ -3051,249 +3936,131 @@ if __name__ == "__main__":
 
     print(f"Found {len(common_ids)} matching POI and road file pairs")
 
-    # Select first road file for training data generation and model training
-    first_id = list(common_ids)[0]
-    first_road_file = road_map.get(first_id, nav_map.get(first_id))
-    
-    # Define a simplified function to generate training data without relying on MULTIDIGIT column
-    def generate_simple_training_data(roads_file, output_file, num_samples=1000):
-        """Generate simple training data without relying on specific columns"""
-        print(f"Using simplified training data generator for {roads_file}")
-        try:
-            # Load roads GeoDataFrame
-            import geopandas as gpd
-            roads = gpd.read_file(roads_file)
-            print(f"Loaded {len(roads)} road segments with columns: {list(roads.columns)}")
-            
-            # Generate synthetic POIs with balanced classes
-            import random
-            
-            data = []
-            num_per_class = num_samples // 4
-            
-            # Sample roads - reuse them if we don't have enough
-            road_samples = roads.sample(min(num_samples, len(roads)), replace=True)
-            
-            # Class 0: POIs marked for deletion (invalid link_id)
-            for i in range(num_per_class):
-                data.append({
-                    'POI_ID': f"SYN_DEL_{i}",
-                    'link_id': f"INVALID_{i}",
-                    'FAC_TYPE': random.randint(1000, 9000),
-                    'POI_NAME': f"Delete POI {i}",
-                    'POI_ST_SD': random.choice(['R', 'L']),
-                    'PERCFRREF': random.random(),
-                    'NAT_IMPORT': 0,
-                    'classification': 0  # Delete
-                })
-            
-            # Class 1: Wrong side of road
-            for i in range(num_per_class):
-                road = road_samples.iloc[i % len(road_samples)]
-                data.append({
-                    'POI_ID': f"SYN_SIDE_{i}",
-                    'link_id': str(road.get('link_id', f"L{i}")),
-                    'FAC_TYPE': random.randint(1000, 9000),
-                    'POI_NAME': f"Wrong Side POI {i}",
-                    'POI_ST_SD': random.choice(['R', 'L']),
-                    'PERCFRREF': random.random(),
-                    'NAT_IMPORT': 0,
-                    'classification': 1  # Wrong side
-                })
-            
-            # Class 2: Incorrect MULTIDIGIT (we simulate based on facility type)
-            for i in range(num_per_class):
-                road = road_samples.iloc[(i + num_per_class) % len(road_samples)]
-                data.append({
-                    'POI_ID': f"SYN_MULTI_{i}",
-                    'link_id': str(road.get('link_id', f"L{i+1000}")),
-                    'FAC_TYPE': random.randint(1000, 3000),  # Non-exception types
-                    'POI_NAME': f"Fix MULTIDIGIT POI {i}",
-                    'POI_ST_SD': random.choice(['R', 'L']),
-                    'PERCFRREF': random.random(),
-                    'NAT_IMPORT': 0,
-                    'classification': 2  # Fix MULTIDIGIT
-                })
-            
-            # Class 3: Legitimate exceptions (special facility types)
-            exception_types = [3538, 4013, 1100, 4170, 4444, 4482, 4493, 4580, 4581, 5000]
-            for i in range(num_per_class):
-                road = road_samples.iloc[(i + 2*num_per_class) % len(road_samples)]
-                data.append({
-                    'POI_ID': f"SYN_EXC_{i}",
-                    'link_id': str(road.get('link_id', f"L{i+2000}")),
-                    'FAC_TYPE': random.choice(exception_types),
-                    'POI_NAME': f"Exception POI {i}",
-                    'POI_ST_SD': random.choice(['R', 'L']),
-                    'PERCFRREF': random.random(),
-                    'NAT_IMPORT': 1,
-                    'classification': 3  # Legitimate exception
-                })
-            
-            # Create DataFrame and save to CSV
-            df = pd.DataFrame(data)
-            df.to_csv(output_file, index=False)
-            print(f"Created {len(df)} synthetic samples with {num_per_class} POIs per class")
-            
-            return df
-            
-        except Exception as e:
-            print(f"Error in simplified training data generation: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            
-            # Create minimal dataset as fallback
-            fallback_data = []
-            for class_id in range(4):  # 0-3 classes
-                for i in range(50):  # 50 samples per class
-                    fallback_data.append({
-                        'POI_ID': f"FB_{class_id}_{i}",
-                        'link_id': f"LINK_{i}" if class_id > 0 else f"INVALID_{i}",
-                        'FAC_TYPE': 4580 if class_id == 3 else random.randint(1000, 3000),
-                        'POI_NAME': f"Class {class_id} POI {i}",
-                        'POI_ST_SD': 'R',
-                        'PERCFRREF': 0.5,
-                        'NAT_IMPORT': 1 if class_id == 3 else 0,
-                        'classification': class_id
-                    })
-            
-            df = pd.DataFrame(fallback_data)
-            df.to_csv(output_file, index=False)
-            print(f"Created fallback training data with {len(df)} samples")
-            return df
+    # Full pipeline execution wrapped in try-except
+    try:
+        # Only train the model if not skipping training
+        if not args.skip_training:
+            # Training code here...
+            pass
 
-    # Use our robust synthetic data generator
-    synthetic_data_file = "synthetic_training_data.csv"
-    print(f"Generating synthetic training data using roads from {first_road_file}")
-    
-    try:
-        # Use the simplified generator that doesn't rely on MULTIDIGIT column
-        synthetic_data = generate_simple_training_data(
-            roads_file=first_road_file,
-            output_file=synthetic_data_file, 
-            num_samples=2000
+        # Now validate the real POI data using our automated pipeline
+        print("\n=== Running Automated POI Validation and Correction ===")
+        
+        # Prepare files for automated validation
+        active_poi_files = []
+        active_road_files = []
+        
+        for file_id in common_ids:
+            poi_file = poi_map[file_id]
+            # Prefer NAMING_ADDRESSING over NAV if both exist
+            road_file = road_map.get(file_id, nav_map.get(file_id))
+            
+            active_poi_files.append(poi_file)
+            active_road_files.append(road_file)
+        
+        # Run the automated pipeline with all files
+        output_dir = "automated_validation_results"
+        
+        # Call our automated pipeline
+        summary = automated_poi_validation_pipeline(
+            poi_files=active_poi_files,
+            roads_files=active_road_files,
+            output_dir=output_dir,
+            auto_fix=not args.no_auto_fix
         )
+        
+        # Display summary results
+        print("\n=== AUTOMATED VALIDATION SUMMARY ===")
+        print(f"Total POIs processed: {summary['total_pois']}")
+        print(f"POIs with issues detected: {summary['total_issues']}")
+        print(f"Changes applied: {summary['total_changes']}")
+        
+        # Print class distribution
+        class_names = {
+            0: "Non-existent POIs (to delete)",
+            1: "Wrong Side of Road",
+            2: "Incorrect MULTIDIGIT", 
+            3: "Legitimate Exceptions",
+            -1: "No issues detected"
+        }
+        
+        for class_id, count in summary['class_distribution'].items():
+            if class_id in class_names:
+                percent = (count / summary['total_pois'] * 100) if summary['total_pois'] > 0 else 0
+                print(f"{class_names[class_id]}: {count} ({percent:.1f}%)")
+        
+        print(f"\nDetailed report available at: {output_dir}/validation_report.html")
+        
     except Exception as e:
-        print(f"Error generating synthetic data: {str(e)}")
+        print(f"Error in automated validation pipeline: {str(e)}")
         import traceback
         traceback.print_exc()
         
-        # If we can't create new synthetic data but have existing data, use that
-        if os.path.exists(synthetic_data_file):
-            print(f"Using existing synthetic data from {synthetic_data_file}")
-        else:
-            print("No synthetic training data available. Cannot continue.")
-            exit(1)
-    
-    # Train a new model using synthetic data
-    print("Training new model with synthetic data...")
-    try:
-        model = train_model(
-            data_file=synthetic_data_file,
-            roads_file=first_road_file,
-            output_file="poi_validation_model.joblib"
-        )
-        print("Model trained successfully!")
-    except Exception as e:
-        print(f"Error training model: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        # Fall back to original validation as backup
+        print("\nFalling back to basic validation...")
         
-        # If training fails but we have an existing model, use that
-        if os.path.exists("poi_validation_model.joblib"):
-            print("Using existing model from poi_validation_model.joblib")
-        else:
-            # Create a simple fallback model as last resort
-            print("Creating simple fallback model...")
+        # Create a summary dataframe to track performance across all datasets
+        overall_results = pd.DataFrame(columns=['file_id', 'poi_count', 'class_0_count', 
+                                              'class_1_count', 'class_2_count', 'class_3_count'])
+        
+        # Process each pair of files with the original validate_pois function
+        for file_id in common_ids:
             try:
-                from sklearn.ensemble import RandomForestClassifier
-                import joblib
+                print(f"\n===== Processing POI and road files with ID: {file_id} =====")
                 
-                # Create a simple model with minimal features
-                X = pd.read_csv(synthetic_data_file)
-                if 'classification' in X.columns:
-                    y = X['classification']
-                    # Use only basic numeric features
-                    feature_cols = ['road_side', 'is_exception_type', 'nat_import']
-                    for col in feature_cols:
-                        if col not in X.columns:
-                            X[col] = 0  # Add missing columns with default values
-                    
-                    model = RandomForestClassifier(n_estimators=50, random_state=42)
-                    model.fit(X[feature_cols], y)
-                    joblib.dump(model, "poi_validation_model.joblib")
-                    print("Created simple fallback model")
-                else:
-                    print("Cannot train model: no classification column in synthetic data")
-                    exit(1)
-            except Exception as e2:
-                print(f"Failed to create fallback model: {str(e2)}")
-                exit(1)
-
-    # Now validate the real POI data using our model
-    print("\n=== Validating Real POI Data ===")
-    
-    # Create a summary dataframe to track performance across all datasets
-    overall_results = pd.DataFrame(columns=['file_id', 'poi_count', 'class_0_count', 
-                                           'class_1_count', 'class_2_count', 'class_3_count'])
-    
-    # Process each pair of files
-    for file_id in common_ids:
-        print(f"\n===== Processing POI and road files with ID: {file_id} =====")
+                poi_file = poi_map[file_id]
+                road_file = road_map.get(file_id, nav_map.get(file_id))
+                
+                output_dir = f"validation_results_{file_id}"
+                
+                # Validate POIs with original function
+                print(f"Validating POIs from {poi_file} against roads from {road_file}")
+                
+                results = validate_pois(
+                    poi_file=poi_file,
+                    roads_file=road_file,
+                    model_file="poi_validation_model.joblib",
+                    output_dir=output_dir,
+                    batch_size=args.batch_size
+                )
+                
+                # Save results summary for this dataset
+                if results is not None and 'predicted_label' in results.columns:
+                    summary = results['predicted_label'].value_counts().to_dict()
+                    summary_row = {
+                        'file_id': file_id,
+                        'poi_count': len(results),
+                        'class_0_count': summary.get(0, 0),  # Deletion
+                        'class_1_count': summary.get(1, 0),  # Wrong side
+                        'class_2_count': summary.get(2, 0),  # Incorrect MULTIDIGIT
+                        'class_3_count': summary.get(3, 0)   # Legitimate exception
+                    }
+                    overall_results = pd.concat([overall_results, pd.DataFrame([summary_row])], ignore_index=True)
+                
+                print(f"Results saved to {output_dir}")
+                
+            except Exception as e:
+                print(f"Error processing file {file_id}: {str(e)}")
+                import traceback
+                traceback.print_exc()
         
-        poi_file = poi_map[file_id]
-        # Prefer NAMING_ADDRESSING over NAV if both exist
-        road_file = road_map.get(file_id, nav_map.get(file_id))
-        
-        output_dir = f"validation_results_{file_id}"
-        
-        # Validate POIs
-        print(f"Validating POIs from {poi_file} against roads from {road_file}")
-        try:
-            results = validate_pois(
-                poi_file=poi_file,
-                roads_file=road_file,
-                model_file="poi_validation_model.joblib",
-                output_dir=output_dir,
-                batch_size=10  # Adjust batch size as needed
-            )
+        # Save overall summary
+        if not overall_results.empty:
+            summary_path = "validation_summary.csv"
+            overall_results.to_csv(summary_path, index=False)
             
-            # Save results summary for this dataset
-            if results is not None and 'predicted_label' in results.columns:
-                summary = results['predicted_label'].value_counts().to_dict()
-                summary_row = {
-                    'file_id': file_id,
-                    'poi_count': len(results),
-                    'class_0_count': summary.get(0, 0),  # Deletion
-                    'class_1_count': summary.get(1, 0),  # Wrong side
-                    'class_2_count': summary.get(2, 0),  # Incorrect MULTIDIGIT
-                    'class_3_count': summary.get(3, 0)   # Legitimate exception
-                }
-                overall_results = pd.concat([overall_results, pd.DataFrame([summary_row])], ignore_index=True)
-            
-            print(f"Results saved to {output_dir}")
-        except Exception as e:
-            print(f"Error processing file {file_id}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-    
-    # Save overall summary
-    if not overall_results.empty:
-        summary_path = "validation_summary.csv"
-        overall_results.to_csv(summary_path, index=False)
-        
-        # Print overall statistics
-        total_pois = overall_results['poi_count'].sum()
-        if total_pois > 0:
-            total_class0 = overall_results['class_0_count'].sum()
-            total_class1 = overall_results['class_1_count'].sum() 
-            total_class2 = overall_results['class_2_count'].sum()
-            total_class3 = overall_results['class_3_count'].sum()
-            
-            print("\n=== OVERALL VALIDATION SUMMARY ===")
-            print(f"Total POIs processed across all datasets: {total_pois}")
-            print(f"POIs to delete: {total_class0} ({total_class0/total_pois*100:.1f}%)")
-            print(f"POIs with wrong side: {total_class1} ({total_class1/total_pois*100:.1f}%)")
-            print(f"POIs with incorrect MULTIDIGIT: {total_class2} ({total_class2/total_pois*100:.1f}%)")
-            print(f"Legitimate exceptions: {total_class3} ({total_class3/total_pois*100:.1f}%)")
-            print(f"Summary saved to {summary_path}")
+            # Print overall statistics
+            total_pois = overall_results['poi_count'].sum()
+            if total_pois > 0:
+                total_class0 = overall_results['class_0_count'].sum()
+                total_class1 = overall_results['class_1_count'].sum() 
+                total_class2 = overall_results['class_2_count'].sum()
+                total_class3 = overall_results['class_3_count'].sum()
+                
+                print("\n=== OVERALL VALIDATION SUMMARY ===")
+                print(f"Total POIs processed across all datasets: {total_pois}")
+                print(f"POIs to delete: {total_class0} ({total_class0/total_pois*100:.1f}%)")
+                print(f"POIs with wrong side: {total_class1} ({total_class1/total_pois*100:.1f}%)")
+                print(f"POIs with incorrect MULTIDIGIT: {total_class2} ({total_class2/total_pois*100:.1f}%)")
+                print(f"Legitimate exceptions: {total_class3} ({total_class3/total_pois*100:.1f}%)")
+                print(f"Summary saved to {summary_path}")
